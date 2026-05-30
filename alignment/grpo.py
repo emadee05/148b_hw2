@@ -217,13 +217,9 @@ def compute_grpo_clip_loss(
     return per_token_loss, metadata
 
 def grpo_microbatch_train_step(
-    policy_log_probs: Tensor,
-    response_mask: Tensor,
-    gradient_accumulation_steps: int,
-    advantages: Tensor,
-    old_log_probs: Tensor,
-    cliprange: float,
-) -> tuple[Tensor, dict[str, Tensor]]:
+    policy_log_probs, response_mask, gradient_accumulation_steps,
+    advantages, old_log_probs, cliprange,
+):
     per_token_loss, metadata = compute_grpo_clip_loss(
         advantages=advantages,
         policy_log_probs=policy_log_probs,
@@ -231,36 +227,21 @@ def grpo_microbatch_train_step(
         cliprange=cliprange,
     )
 
-    # Only response tokens should contribute.
-    response_mask = response_mask.to(per_token_loss.dtype)
+    response_mask_float = response_mask.to(per_token_loss.dtype)
+    num_response_tokens = response_mask_float.sum(dim=1).clamp(min=1.0)  # (B,)
+    per_example_loss = (per_token_loss * response_mask_float).sum(dim=1) / num_response_tokens
+    loss = per_example_loss.mean() / gradient_accumulation_steps
 
-    # Average loss over response tokens for each example.
-    # Shape: (B,)
-    per_example_loss = masked_normalize(
-        tensor=per_token_loss,
-        mask=response_mask,
-        normalize_constant=response_mask.sum(dim=1).clamp(min=1.0),
-        dim=1,
-    )
-
-    # Average across examples in the microbatch.
-    loss = per_example_loss.mean()
-
-    # Scale for gradient accumulation.
-    loss = loss / gradient_accumulation_steps
-
-    # Backprop happens inside this function, per the assignment.
     loss.backward()
 
     metadata = {
         **metadata,
         "loss": loss.detach(),
-        "unscaled_loss": (loss.detach() * gradient_accumulation_steps),
-        "mean_response_length": response_mask.sum(dim=1).float().mean().detach(),
+        "unscaled_loss": loss.detach() * gradient_accumulation_steps,
+        "mean_response_length": response_mask_float.sum(dim=1).float().mean().detach(),
     }
 
     return loss.detach(), metadata
-
 def log_generations(
     prompts: Sequence[str],
     responses: Sequence[str],
@@ -371,6 +352,7 @@ def train_grpo(
         ).to(device)
 
         prompt_lengths = encoded["attention_mask"].sum(dim=1)
+        stop_token_ids = tokenizer.encode("</answer>", add_special_tokens=False)
 
         with torch.no_grad():
             generated_ids = policy.generate(
@@ -382,7 +364,7 @@ def train_grpo(
                 min_new_tokens=sampling_min_tokens,
                 max_new_tokens=sampling_max_tokens,
                 pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=[tokenizer.eos_token_id] + stop_token_ids,
             )
 
         responses: list[str] = []
