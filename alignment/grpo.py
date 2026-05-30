@@ -6,7 +6,8 @@ from typing import Any
 import torch
 from torch import Tensor
 import torch.nn.functional as F
-
+import random
+from tqdm import tqdm
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str],
@@ -298,6 +299,318 @@ def log_generations(
 
     return logs
 
-def train_grpo(*args, **kwargs) -> dict[str, Any]:
-    """Run the full GRPO training loop from Section 3.5."""
-    raise NotImplementedError
+def train_grpo(
+    policy: torch.nn.Module,
+    tokenizer,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    train_prompts: list[str],
+    train_ground_truths: list[str],
+    val_prompts: list[str] | None = None,
+    val_ground_truths: list[str] | None = None,
+    n_grpo_steps: int = 8,
+    learning_rate: float = 1e-5,
+    advantage_eps: float = 1e-6,
+    rollout_batch_size: int = 32,
+    group_size: int = 8,
+    sampling_temperature: float = 1.0,
+    sampling_min_tokens: int = 4,
+    sampling_max_tokens: int = 256,
+    epochs_per_rollout_batch: int = 1,
+    train_batch_size: int = 32,
+    gradient_accumulation_steps: int = 16,
+    cliprange: float = 1.0,
+    normalize_by_std: bool = True,
+    eval_every: int = 5,
+    n_val_examples: int = 256,
+    max_grad_norm: float = 1.0,
+    device: str | torch.device | None = None,
+) -> dict[str, Any]:
+    """Run the full GRPO training loop from Section 3.5.
+
+    This version uses HuggingFace generation directly instead of vLLM.
+    """
+
+    assert rollout_batch_size % group_size == 0
+    assert train_batch_size % gradient_accumulation_steps == 0
+    assert train_batch_size <= rollout_batch_size
+
+    if device is None:
+        device = next(policy.parameters()).device
+    else:
+        device = torch.device(device)
+        policy.to(device)
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    optimizer = torch.optim.Adam(
+        policy.parameters(),
+        lr=learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
+    )
+
+    micro_train_batch_size = train_batch_size // gradient_accumulation_steps
+    n_prompts_per_rollout_batch = rollout_batch_size // group_size
+
+    logs: dict[str, Any] = {
+        "train": [],
+        "val": [],
+        "generations": [],
+    }
+
+    def generate_responses(prompts: list[str]) -> list[str]:
+        """Generate responses from policy for a list of prompts."""
+        policy.eval()
+
+        encoded = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+        ).to(device)
+
+        prompt_lengths = encoded["attention_mask"].sum(dim=1)
+
+        with torch.no_grad():
+            generated_ids = policy.generate(
+                input_ids=encoded["input_ids"],
+                attention_mask=encoded["attention_mask"],
+                do_sample=True,
+                temperature=sampling_temperature,
+                top_p=1.0,
+                min_new_tokens=sampling_min_tokens,
+                max_new_tokens=sampling_max_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        responses: list[str] = []
+
+        for i in range(generated_ids.shape[0]):
+            response_ids = generated_ids[i, prompt_lengths[i]:]
+            response = tokenizer.decode(response_ids, skip_special_tokens=True)
+            responses.append(response)
+
+        return responses
+
+    def evaluate_validation(step: int) -> dict[str, float]:
+        """Evaluate current policy on a small validation subset."""
+        if val_prompts is None or val_ground_truths is None:
+            return {}
+
+        policy.eval()
+
+        n_eval = min(n_val_examples, len(val_prompts))
+        indices = random.sample(range(len(val_prompts)), k=n_eval)
+
+        eval_prompts = [val_prompts[i] for i in indices]
+        eval_ground_truths = [val_ground_truths[i] for i in indices]
+
+        eval_responses = generate_responses(eval_prompts)
+
+        reward_infos = [
+            reward_fn(response, gt)
+            for response, gt in zip(eval_responses, eval_ground_truths)
+        ]
+
+        rewards = [
+            float(info.get("reward", info.get("total_reward", 0.0)))
+            for info in reward_infos
+        ]
+        format_rewards = [
+            float(info.get("format_reward", info.get("format reward", 0.0)))
+            for info in reward_infos
+        ]
+        answer_rewards = [
+            float(info.get("answer_reward", info.get("answer reward", 0.0)))
+            for info in reward_infos
+        ]
+
+        val_log = {
+            "step": float(step),
+            "val_reward": float(sum(rewards) / len(rewards)),
+            "val_format_reward": float(sum(format_rewards) / len(format_rewards)),
+            "val_answer_reward": float(sum(answer_rewards) / len(answer_rewards)),
+        }
+
+        logs["val"].append(val_log)
+
+        # Save a few readable validation examples.
+        generation_logs = log_generations(
+            prompts=eval_prompts[:5],
+            responses=eval_responses[:5],
+            ground_truths=eval_ground_truths[:5],
+            reward_infos=reward_infos[:5],
+        )
+        logs["generations"].append(
+            {
+                "step": step,
+                "examples": generation_logs,
+            }
+        )
+
+        return val_log
+
+    for step in tqdm(range(1, n_grpo_steps + 1), desc="GRPO steps"):
+        policy.eval()
+
+        # ------------------------------------------------------------
+        # 1. Sample prompts.
+        # ------------------------------------------------------------
+        prompt_indices = random.sample(
+            range(len(train_prompts)),
+            k=n_prompts_per_rollout_batch,
+        )
+
+        sampled_prompts = [train_prompts[i] for i in prompt_indices]
+        sampled_ground_truths = [train_ground_truths[i] for i in prompt_indices]
+
+        # Repeat each prompt group_size times.
+        repeated_prompts: list[str] = []
+        repeated_ground_truths: list[str] = []
+
+        for prompt, gt in zip(sampled_prompts, sampled_ground_truths):
+            repeated_prompts.extend([prompt] * group_size)
+            repeated_ground_truths.extend([gt] * group_size)
+
+        # ------------------------------------------------------------
+        # 2. Generate rollout responses from old policy.
+        # ------------------------------------------------------------
+        rollout_responses = generate_responses(repeated_prompts)
+
+        # ------------------------------------------------------------
+        # 3. Compute rewards and group-normalized advantages.
+        # ------------------------------------------------------------
+        advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
+            reward_fn=reward_fn,
+            rollout_responses=rollout_responses,
+            repeated_ground_truths=repeated_ground_truths,
+            group_size=group_size,
+            advantage_eps=advantage_eps,
+            normalize_by_std=normalize_by_std,
+        )
+
+        advantages = advantages.to(device)
+
+        # ------------------------------------------------------------
+        # 4. Tokenize prompt + response pairs.
+        # ------------------------------------------------------------
+        tokenized = tokenize_prompt_and_output(
+            prompt_strs=repeated_prompts,
+            output_strs=rollout_responses,
+            tokenizer=tokenizer,
+        )
+
+        input_ids = tokenized["input_ids"].to(device)
+        labels = tokenized["labels"].to(device)
+        response_mask = tokenized["response_mask"].to(device)
+
+        # ------------------------------------------------------------
+        # 5. Cache old log probs.
+        #    Do not differentiate through these.
+        # ------------------------------------------------------------
+        policy.eval()
+        with torch.no_grad():
+            old_log_probs = get_response_log_probs(
+                model=policy,
+                input_ids=input_ids,
+                labels=labels,
+                return_token_entropy=False,
+            )["log_probs"]
+
+        old_log_probs = old_log_probs.detach()
+
+        # ------------------------------------------------------------
+        # 6. Train on rollout batch.
+        # ------------------------------------------------------------
+        policy.train()
+
+        indices = list(range(rollout_batch_size))
+
+        total_loss = 0.0
+        total_clip_fraction = 0.0
+        n_microbatches = 0
+
+        for _epoch in range(epochs_per_rollout_batch):
+            random.shuffle(indices)
+
+            for start in range(0, rollout_batch_size, train_batch_size):
+                train_indices = indices[start:start + train_batch_size]
+
+                optimizer.zero_grad(set_to_none=True)
+
+                for micro_start in range(0, len(train_indices), micro_train_batch_size):
+                    micro_indices = train_indices[
+                        micro_start:micro_start + micro_train_batch_size
+                    ]
+
+                    mb_input_ids = input_ids[micro_indices]
+                    mb_labels = labels[micro_indices]
+                    mb_response_mask = response_mask[micro_indices]
+                    mb_advantages = advantages[micro_indices]
+                    mb_old_log_probs = old_log_probs[micro_indices]
+
+                    policy_outputs = get_response_log_probs(
+                        model=policy,
+                        input_ids=mb_input_ids,
+                        labels=mb_labels,
+                        return_token_entropy=False,
+                    )
+
+                    policy_log_probs = policy_outputs["log_probs"]
+
+                    loss, metadata = grpo_microbatch_train_step(
+                        policy_log_probs=policy_log_probs,
+                        response_mask=mb_response_mask,
+                        gradient_accumulation_steps=gradient_accumulation_steps,
+                        advantages=mb_advantages,
+                        old_log_probs=mb_old_log_probs,
+                        cliprange=cliprange,
+                    )
+
+                    total_loss += float(loss.item())
+                    total_clip_fraction += float(metadata["clip_fraction"].item())
+                    n_microbatches += 1
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(),
+                    max_grad_norm,
+                )
+
+                optimizer.step()
+
+        mean_loss = total_loss / max(n_microbatches, 1)
+        mean_clip_fraction = total_clip_fraction / max(n_microbatches, 1)
+
+        train_log = {
+            "step": step,
+            "loss": mean_loss,
+            "clip_fraction": mean_clip_fraction,
+            "grad_norm": float(grad_norm.item())
+            if isinstance(grad_norm, torch.Tensor)
+            else float(grad_norm),
+            **reward_metadata,
+        }
+
+        logs["train"].append(train_log)
+
+        print(
+            f"[step {step}] "
+            f"loss={mean_loss:.4f} "
+            f"reward={reward_metadata['mean_reward']:.4f} "
+            f"answer={reward_metadata['mean_answer_reward']:.4f} "
+            f"format={reward_metadata['mean_format_reward']:.4f} "
+            f"clip={mean_clip_fraction:.4f}"
+        )
+
+        if val_prompts is not None and val_ground_truths is not None:
+            if step == 1 or step % eval_every == 0 or step == n_grpo_steps:
+                val_log = evaluate_validation(step)
+                print(
+                    f"  val_reward={val_log.get('val_reward', 0.0):.4f} "
+                    f"val_answer={val_log.get('val_answer_reward', 0.0):.4f} "
+                    f"val_format={val_log.get('val_format_reward', 0.0):.4f}"
+                )
+
+    return logs
